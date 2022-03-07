@@ -19,16 +19,20 @@ class SimSale:
         level_size : list, optional
             各个属性下相应水平的数量, by default [3,3]
         """
-        self.rng = np.random.default_rng(seed=seed)
+        self.rng        = np.random.default_rng(seed=seed)
         self.level_size = level_size
-        self.attr_size = len(self.level_size)
-        self.attr_name = list(ascii_uppercase)[0:self.attr_size]
+        self.attr_size  = len(self.level_size)
+        self.attr_name  = list(ascii_uppercase)[0:self.attr_size]
         self.level_name = list(map(lambda x:list(ascii_lowercase)[0:x],level_size))
         
-        self.attr_f_list = None
-        self.attr_pi_list = None
-        self.goods_f = None
-        self.goods_pi = None
+        self.attr_f_list   = None
+        self.attr_pi_list  = None
+        self.attr_f_theta  = None
+        self.attr_pi_theta = None
+        self.attr_theta    = None
+        self.goods_f       = None
+        self.goods_pi      = None
+        
         self.generate_attr_param()
         self.generate_goods_param()
         
@@ -50,14 +54,31 @@ class SimSale:
             
             # 间接转移概率
             attr_pi = self.rng.uniform(low=0,
-                                       high=0.99,
+                                       high=0.9,
                                        size=[self.level_size[i],self.level_size[i]])
             attr_pi[np.diag_indices_from(attr_pi)] = 1
             attr_pi = pd.DataFrame(data=attr_pi,
                                    index=self.level_name[i],
                                    columns=self.level_name[i])
             self.attr_pi_list.append(attr_pi)
-    
+        
+        # 直接选择概率（向量）
+        self.attr_f_theta = np.array([])
+        for attr_f in self.attr_f_list:
+            attr_f            = attr_f.to_numpy()
+            self.attr_f_theta = np.append(self.attr_f_theta,attr_f)
+        
+        # 间接转移概率（向量）
+        self.attr_pi_theta = np.array([])
+        for attr_pi in self.attr_pi_list:
+            attr_pi         = attr_pi.to_numpy()
+            attr_pi_triu    = attr_pi[np.triu_indices_from(attr_pi,k=1)]
+            attr_pi_tril    = attr_pi[np.tril_indices_from(attr_pi,k=-1)]
+            self.attr_pi_theta = np.append(self.attr_pi_theta,attr_pi_triu)
+            self.attr_pi_theta = np.append(self.attr_pi_theta,attr_pi_tril)
+            
+        self.attr_theta = np.append(self.attr_f_theta,self.attr_pi_theta)
+
     def generate_goods_param(self):
         """
         通过属性计算商品的选择及转移参数

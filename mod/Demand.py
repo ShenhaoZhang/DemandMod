@@ -3,14 +3,16 @@ from functools import reduce
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution,basinhopping,dual_annealing
+from scipy.optimize import differential_evolution,basinhopping,dual_annealing,minimize
 import matplotlib.pyplot as plt
 from numba import jit
+# from numdifftools import Hessian
 
 class Demand:
-    def __init__(self,data,goods_attr) -> None:
+    def __init__(self,data,goods_attr,reparam=True) -> None:
         self.data       = data
         self.goods_attr = goods_attr # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
+        self.reparam    = reparam
         
         self.attr_name         = None
         self.attr_type         = None
@@ -21,12 +23,15 @@ class Demand:
         self._init_attr()
         self._init_attr_trans()
         
-        self.theta_hat = None
+        self.theta_hat          = None
+        self.theta_hat_attr_f   = None
+        self.theta_hat_attr_pi  = None
+        self.theta_hat_goods_f  = None
+        self.theta_hat_goods_pi = None
         
     #TODO 增加data的初始化方法
     #TODO 增加通过先验确定转移参数
     #TODO 通过似然函数度量参数的不确定性
-    #TODO 使用Numba加速
     
     def _init_attr(self):
         self.attr_name         = list(self.goods_attr) # ['price', 'size']
@@ -121,7 +126,7 @@ class Demand:
                 
             theta_f_list.append(theta_f)
             theta_pi_flatten_list.append(theta_pi)
-            
+        
         ## 将属性转移概率转换为矩阵形式
         theta_pi_list = []
         for i in range(len(theta_pi_flatten_list)):
@@ -135,7 +140,7 @@ class Demand:
             m[np.tril_indices(n=dim, k=-1)] = pi_tril  # 下三角
             theta_pi_list.append(m)
         
-        if to_goods:
+        if to_goods is True:
             # 通过【属性】的选择概率和转移概率 转换为 【商品】的选择概率和转移概率
             ## 将属性概率笛卡尔积并相乘后得到商品的选择概率
             theta_f = list(map(lambda l:reduce(lambda x,y:x*y,l),product(*theta_f_list)))
@@ -154,7 +159,7 @@ class Demand:
             return theta_f,theta_pi
         else :
             #【属性】的选择概率和转移概率
-            return theta_f_list,theta_pi_flatten_list         
+            return theta_f_list,theta_pi_flatten_list
     
     def get_loglikelihood(self,theta_flatten):
         """
@@ -170,88 +175,22 @@ class Demand:
         float
             似然函数值
         """
-        theta_f,theta_pi = self.init_theta(theta_flatten=theta_flatten)
+        theta_f,theta_pi = self.init_theta(theta_flatten = theta_flatten,
+                                           reparam = self.reparam)
         data = self.data.to_numpy()
-        llh = loglikelihood(theta_f=theta_f,
-                            theta_pi=theta_pi,
-                            data_numpy=data)
+        llh = loglikelihood(theta_f = theta_f,
+                            theta_pi = theta_pi,
+                            data_numpy = data)
         return llh
     
-    # def single_likelihood(self,theta_f,theta_pi,sample):
-    #     """
-    #     当个样本的似然
-
-    #     Parameters
-    #     ----------
-    #     theta : dict
-    #         通过self.init_theta得到的theta
-    #     sr : Pandas Series
-    #         单个样本
-
-    #     Returns
-    #     -------
-    #     float
-    #         似然
-    #     """
-    #     theta_f = theta_f
-    #     theta_pi = theta_pi
-        
-    #     trans_pi = theta_pi[np.isnan(sample),:]
-    #     trans_pi[:,np.isnan(sample)] = 0
-        
-    #     # 转移矩阵只保留每行最大的元素
-    #     trans_pi_max = np.zeros_like(trans_pi)
-    #     row_indices = np.arange(trans_pi.shape[0])
-    #     col_indices = np.argmax(trans_pi,axis=1)
-    #     trans_pi_max[row_indices,col_indices] = trans_pi[row_indices,col_indices]
-        
-    #     trans_f = np.dot(theta_f[np.isnan(sample)],trans_pi_max)
-        
-    #     theta_f_total = theta_f + trans_f
-    #     theta_f_total[np.isnan(sample)] = 0
-    #     theta_f_total = theta_f_total[~np.isnan(sample)]
-    #     sample = sample[~np.isnan(sample)] 
-        
-    #     llh = np.sum(sample*np.log(theta_f_total)) - np.sum(sample)*np.log(np.sum(theta_f_total))
-    #     return llh
-        
-    # def likelihood(self,theta_flatten,reparam=True):
-    #     """
-    #     似然函数
-
-    #     Parameters
-    #     ----------
-    #     theta_flatten : list
-    #         待估计参数
-    #     reparam : bool
-    #         当设为False时,theta_flatten必须为百分比值,仅用于验证目的
-
-    #     Returns
-    #     -------
-    #     float
-    #         似然(取负值)
-    #     """
-        
-    #     theta_f,theta_pi = self.init_theta(theta_flatten  = theta_flatten,
-    #                                        reparam        = reparam,
-    #                                        to_goods       = True,
-    #                                        goods_to_numpy = True)
-        
-    #     llh_list = np.apply_along_axis(func1d=lambda x:self.single_likelihood(theta_f  = theta_f,
-    #                                                                           theta_pi = theta_pi,
-    #                                                                           sample   = x),
-    #                                    axis=1,
-    #                                    arr=self.data.to_numpy())
-    #     return -np.sum(llh_list)
-    
-    def fit(self,method='differential_evolution',**kwargs):
+    def fit(self,method='dual_annealing',**kwargs):
         """
         模型拟合,估计参数
 
         Parameters
         ----------
         method : str, optional
-            最优化方法,见scipy的globel optim, by default 'differential_evolution'
+            最优化方法,见scipy的globel optim, by default 'dual_annealing'
 
         Returns
         -------
@@ -260,59 +199,106 @@ class Demand:
         """
         f_flatten_len = len(self.attr_type_flatten)
         pi_flatten_len = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
-        
-        bounds_up = [1]*f_flatten_len + [3]*pi_flatten_len
-        bounds_dw = [-1]*f_flatten_len + [-3]*pi_flatten_len
+        if self.reparam is True:
+            bounds_up = [1]*f_flatten_len + [3]*pi_flatten_len
+            bounds_dw = [-1]*f_flatten_len + [-3]*pi_flatten_len
+            x0 = np.zeros(shape=f_flatten_len+pi_flatten_len)+0.1
+        else:
+            bounds_up = [0.99]*f_flatten_len + [0.99]*pi_flatten_len
+            bounds_dw = [0.01]*f_flatten_len + [0.01]*pi_flatten_len
         bounds = list(zip(bounds_dw,bounds_up))
         
         if method == 'differential_evolution':
             opt = differential_evolution(
-                func=self.get_loglikelihood,
-                x0=np.random.normal(loc=0,scale=0.1,size=f_flatten_len+pi_flatten_len),
-                bounds=bounds,
-                workers=-1,
-                **kwargs)
-            
-        if method == 'basinhopping':
-            opt = basinhopping(
-                func=self.get_loglikelihood,
-                x0=np.random.normal(loc=0,scale=0.1,size=f_flatten_len+pi_flatten_len),
-                minimizer_kwargs={'method':'BFGS'},
+                func    = self.get_loglikelihood,
+                x0      = x0,
+                bounds  = bounds,
+                workers = -1,
                 **kwargs)
         
-        if method == 'dual_annealing':
+        elif method == 'dual_annealing':
             opt = dual_annealing(
-                func= self.get_loglikelihood,
+                func   = self.get_loglikelihood,
+                bounds = bounds,
+                **kwargs
+            )
+        else:
+            opt = minimize(
+                fun    = self.get_loglikelihood,
+                x0     = x0,
                 bounds = bounds,
                 **kwargs
             )
         
-        self.theta_hat = opt
+        self.theta_hat          = opt
+        self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=self.reparam)[0]
+        self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=self.reparam)[1]
+        self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=self.reparam)[0]
+        self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=self.reparam)[1]
         
         return self.theta_hat
     
-    def validation(self,SimSale,interval=0.1):
+    def score(self,SimSale,interval=0.1,plot=False):
         """
-        通过模拟数据严重参数的估计结果
+        通过模拟数据验证参数的估计结果
 
         Parameters
         ----------
         SimSale : SimSale对象
             模拟的数据对象
         """
-        x_goods_pi_theta     = SimSale.goods_pi.to_numpy().flatten()
-        y_goods_pi_theta_hat = self.init_theta(self.theta_hat.x)[1].flatten()
+        # 属性转移概率参数
+        x_attr_pi_theta = SimSale.attr_pi_theta
+        y_attr_pi_theta_hat = np.array(self.theta_hat_attr_pi).flatten()
         
-        plt.scatter(x_goods_pi_theta[x_goods_pi_theta!=1],
-                    y_goods_pi_theta_hat[y_goods_pi_theta_hat!=1])
-        plt.axline([0,0],slope=1,color='r')
-        plt.axline([0,-interval],slope=1,color='b',ls='--')
-        plt.axline([0,interval],slope=1,color='b',ls='--')
-        plt.xlabel('theta')
-        plt.ylabel('theta_hat')
+        # 商品转移概率参数
+        x_goods_pi_theta     = SimSale.goods_pi.to_numpy().flatten()
+        y_goods_pi_theta_hat = self.theta_hat_goods_pi.flatten()
+        
+        SSR = np.sum((x_goods_pi_theta-y_goods_pi_theta_hat)**2)
+        SST = np.sum((y_goods_pi_theta_hat-np.mean(y_goods_pi_theta_hat))**2)
+        R2 = 1 - SSR / SST
+        
+        if plot is True:
+            
+            fig,(ax1,ax2) = plt.subplots(1,2,figsize=(8,4))
+            
+            ax1.scatter(x_attr_pi_theta,y_attr_pi_theta_hat)
+            ax1.axline([0,0],slope=1,color='r')
+            ax1.axline([0,-interval],slope=1,color='b',ls='--')
+            ax1.axline([0,interval],slope=1,color='b',ls='--')
+            ax1.set_xlabel('attr_pi')
+            ax1.set_ylabel('attr_pi_theta')
+            
+            ax2.scatter(x_goods_pi_theta[x_goods_pi_theta!=1],
+                        y_goods_pi_theta_hat[y_goods_pi_theta_hat!=1])
+            ax2.axline([0,0],slope=1,color='r')
+            ax2.axline([0,-interval],slope=1,color='b',ls='--')
+            ax2.axline([0,interval],slope=1,color='b',ls='--')
+            ax2.set_xlabel('goods_pi')
+            ax2.set_ylabel('goods_pi_theta')
+        
+        return R2
     
 @jit(nopython = True)
 def loglikelihood(theta_f,theta_pi,data_numpy):
+    """
+    计算似然函数值, 通过numba加速
+
+    Parameters
+    ----------
+    theta_f : ndarray
+        直接选择某个商品的概率
+    theta_pi : ndarray
+        属性之间的转移概率
+    data_numpy : ndarray
+        样本数据
+
+    Returns
+    -------
+    float
+        似然函数值
+    """
     sum_llh = 0
     for sample in data_numpy:
         trans_pi = theta_pi[np.isnan(sample),:]
@@ -341,4 +327,5 @@ def loglikelihood(theta_f,theta_pi,data_numpy):
         
         llh = np.sum(sample*np.log(theta_f_total)) - np.sum(sample)*np.log(np.sum(theta_f_total))
         sum_llh += llh
+        
     return -sum_llh
