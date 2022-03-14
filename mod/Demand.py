@@ -1,18 +1,19 @@
 from itertools import product,accumulate,chain
 from functools import reduce
+from joblib import Parallel, delayed
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution,basinhopping,dual_annealing,minimize
 import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution,dual_annealing,minimize
 from numba import jit
 # from numdifftools import Hessian
 
 class Demand:
-    def __init__(self,data,goods_attr,reparam=True) -> None:
+    def __init__(self,data,goods_attr,llh_method='numba') -> None:
         self.data       = data
         self.goods_attr = goods_attr # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
-        self.reparam    = reparam
+        self.llh_method = llh_method
         
         self.attr_name         = None
         self.attr_type         = None
@@ -34,10 +35,20 @@ class Demand:
     #TODO 通过似然函数度量参数的不确定性
     
     def _init_attr(self):
-        self.attr_name         = list(self.goods_attr) # ['price', 'size']
-        self.attr_type         = [list(map(lambda x:name+'_'+x,level)) for name,level in self.goods_attr.items()] # [['price_l','price_s'], ['size_l','size_s']]
+        """
+        初始化属性
+        """
+        # ['price', 'size']
+        self.attr_name         = list(self.goods_attr)
+        
+        # [['price_l','price_s'], ['size_l','size_s']]
+        self.attr_type         = [list(map(lambda x:name+'_'+x,level)) for name,level in self.goods_attr.items()] 
+        
+        # ['price_l','price_s','size_l','size_s']
         self.attr_type_flatten = list(chain(*self.attr_type))
-        self.goods_type        = list(map(lambda attrs:reduce(lambda x,y:x+'*'+y,attrs),product(*self.attr_type))) #['price_l * size_l', 'price_l * size_m']
+        
+        #['price_l * size_l', 'price_l * size_m']
+        self.goods_type        = list(map(lambda attrs:reduce(lambda x,y:x+'*'+y,attrs),product(*self.attr_type)))
     
     def _init_attr_trans(self):
         """
@@ -55,20 +66,20 @@ class Demand:
                 trans_in = self.data.drop(labels=trans_out.columns,axis=1)
                 
                 # 转出中任意一个为空值为1
-                trans_out = trans_out.mask(~trans_out.isna(),0)
-                trans_out = trans_out.mask(trans_out.isna(),1)
-                trans_out = trans_out.sum(axis=1)
-                trans_out = trans_out.mask(trans_out>0,1).reset_index(drop=True)
+                trans_out      = trans_out.mask(~trans_out.isna(),0)
+                trans_out      = trans_out.mask(trans_out.isna(),1)
+                trans_out      = trans_out.sum(axis=1)
+                trans_out      = trans_out.mask(trans_out>0,1).reset_index(drop=True)
                 trans_out.name = 'out'
                 
                 # 转入中任意一个不为空值为1
-                trans_in = trans_in.mask(~trans_in.isna(),1)
-                trans_in = trans_in.mask(trans_in.isna(),0)
+                trans_in     = trans_in.mask(~trans_in.isna(),1)
+                trans_in     = trans_in.mask(trans_in.isna(),0)
                 trans_in_col = list(trans_in.columns)
                 trans_in_col = list(map(lambda x:x.split('*')[attr],trans_in_col))
-                trans_in = trans_in.set_axis(trans_in_col,axis=1)
-                trans_in = trans_in.reset_index(drop=True).stack().groupby(level=[0,1]).sum().unstack()
-                trans_in = trans_in.mask(trans_in > 0, 1)
+                trans_in     = trans_in.set_axis(trans_in_col,axis=1)
+                trans_in     = trans_in.reset_index(drop=True).stack().groupby(level=[0,1]).sum().unstack()
+                trans_in     = trans_in.mask(trans_in > 0, 1)
                 
                 df = pd.concat([trans_out,trans_in],axis=1)
                 df = df.groupby('out').sum().reindex([0,1],axis=0).loc[lambda dt:dt.index==1]
@@ -145,13 +156,14 @@ class Demand:
             ## 将属性概率笛卡尔积并相乘后得到商品的选择概率
             theta_f = list(map(lambda l:reduce(lambda x,y:x*y,l),product(*theta_f_list)))
             theta_f = pd.Series(data=theta_f,index=self.goods_type)
+            #FIXME 取消pandas
                 
             ## 将属性转移概率转换为商品转移概率（使用克罗内克积）
             theta_pi = reduce(np.kron, theta_pi_list)
             theta_pi = pd.DataFrame(data=theta_pi, 
                                     columns=self.goods_type, 
                                     index=self.goods_type)
-            
+            #FIXME 改成goods_to_Series
             if goods_to_numpy is True:
                 theta_f  = theta_f.to_numpy()
                 theta_pi = theta_pi.to_numpy()
@@ -175,9 +187,16 @@ class Demand:
         float
             似然函数值
         """
-        theta_f,theta_pi = self.init_theta(theta_flatten = theta_flatten,
-                                           reparam = self.reparam)
+        theta_f,theta_pi = self.init_theta(theta_flatten = theta_flatten)
         data = self.data.to_numpy()
+        
+        # 两种途径计算似然函数，numba计算效率高，python适应性强
+        if self.llh_method == 'numba':
+            loglikelihood = loglikelihood_numba
+        else:
+            pass
+            # loglikelihood = loglikelihood_python
+            
         llh = loglikelihood(theta_f = theta_f,
                             theta_pi = theta_pi,
                             data_numpy = data)
@@ -199,14 +218,11 @@ class Demand:
         """
         f_flatten_len = len(self.attr_type_flatten)
         pi_flatten_len = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
-        if self.reparam is True:
-            bounds_up = [1]*f_flatten_len + [3]*pi_flatten_len
-            bounds_dw = [-1]*f_flatten_len + [-3]*pi_flatten_len
-            x0 = np.zeros(shape=f_flatten_len+pi_flatten_len)+0.1
-        else:
-            bounds_up = [0.99]*f_flatten_len + [0.99]*pi_flatten_len
-            bounds_dw = [0.01]*f_flatten_len + [0.01]*pi_flatten_len
+        
+        bounds_up = [1]*f_flatten_len + [3]*pi_flatten_len
+        bounds_dw = [-1]*f_flatten_len + [-3]*pi_flatten_len
         bounds = list(zip(bounds_dw,bounds_up))
+        x0 = np.zeros(shape=f_flatten_len+pi_flatten_len)+0.1
         
         if method == 'differential_evolution':
             opt = differential_evolution(
@@ -231,14 +247,84 @@ class Demand:
             )
         
         self.theta_hat          = opt
-        self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=self.reparam)[0]
-        self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=self.reparam)[1]
-        self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=self.reparam)[0]
-        self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=self.reparam)[1]
+        self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=True)[0]
+        self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=True)[1]
+        self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=True)[0]
+        self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=True)[1]
         
         return self.theta_hat
     
-    def score(self,SimSale,interval=0.1,plot=False):
+    def conf_int(self,method='Bootstrap',level=0.95,plot=True,bootstrap_n=10,SimSale=None):
+        """
+        参数的置信区间
+
+        Parameters
+        ----------
+        method : str
+            计算置信区间的方法
+        level : float, optional
+            置信水平, by default 0.95
+
+        Returns
+        -------
+        tuple
+            置信区间的上界和下界
+        """
+        
+        # 保存对象原始属性
+        org_theta_hat          = self.theta_hat
+        org_theta_hat_attr_f   = self.theta_hat_attr_f
+        org_theta_hat_attr_pi  = self.theta_hat_attr_pi
+        org_theta_hat_goods_f  = self.theta_hat_goods_f
+        org_theta_hat_goods_pi = self.theta_hat_goods_pi
+        
+        if method == 'Bootstrap':
+            theta_list = []
+            for i in range(bootstrap_n):
+                sample_data = self.data.sample(frac=1,replace=True)
+                self.__init__(data=sample_data,goods_attr=self.goods_attr)
+                theta_list.append(self.fit().x)
+                
+            theta_matrix = np.column_stack(theta_list)
+            
+            int_up       = np.quantile(theta_matrix,q=level+(1-level)/2,axis=1)
+            int_up       = self.init_theta(int_up,to_goods=False)
+            int_up       = np.append(np.concatenate(int_up[0]),np.concatenate(int_up[1]))
+            
+            int_dw       = np.quantile(theta_matrix,q=(1-level)/2,axis=1)
+            int_dw       = self.init_theta(int_dw,to_goods=False)
+            int_dw       = np.append(np.concatenate(int_dw[0]),np.concatenate(int_dw[1]))
+
+            int_md       = np.quantile(theta_matrix,q=0.5,axis=1)
+            int_md       = self.init_theta(int_md,to_goods=False)
+            int_md       = np.append(np.concatenate(int_md[0]),np.concatenate(int_md[1]))
+            
+        if method == 'Wald':
+            pass
+        
+        # 回复对象原始属性
+        self.theta_hat          = org_theta_hat
+        self.theta_hat_attr_f   = org_theta_hat_attr_f
+        self.theta_hat_attr_pi  = org_theta_hat_attr_pi
+        self.theta_hat_goods_f  = org_theta_hat_goods_f
+        self.theta_hat_goods_pi = org_theta_hat_goods_pi
+        
+        if plot is True:
+            fig,ax0 = plt.subplots()
+            ax0.errorbar(
+                x    = int_md,
+                y    = np.arange(len(int_up)),
+                xerr = [int_up - int_md, int_md - int_dw],
+                fmt='o'
+            )
+            if SimSale is not None:
+                ax0.scatter(x     = np.append(SimSale.attr_f_theta,SimSale.attr_pi_theta),
+                            y     = np.arange(len(int_up)),
+                            color = 'red')
+        
+        return int_up,int_dw
+    
+    def score(self,SimSale,interval=0.1,plot=False,plot_ci=False):
         """
         通过模拟数据验证参数的估计结果
 
@@ -268,7 +354,7 @@ class Demand:
             ax1.axline([0,-interval],slope=1,color='b',ls='--')
             ax1.axline([0,interval],slope=1,color='b',ls='--')
             ax1.set_xlabel('attr_pi')
-            ax1.set_ylabel('attr_pi_theta')
+            ax1.set_ylabel('attr_pi_hat')
             
             ax2.scatter(x_goods_pi_theta[x_goods_pi_theta!=1],
                         y_goods_pi_theta_hat[y_goods_pi_theta_hat!=1])
@@ -276,12 +362,13 @@ class Demand:
             ax2.axline([0,-interval],slope=1,color='b',ls='--')
             ax2.axline([0,interval],slope=1,color='b',ls='--')
             ax2.set_xlabel('goods_pi')
-            ax2.set_ylabel('goods_pi_theta')
+            ax2.set_ylabel('goods_pi_hat')
         
         return R2
-    
+
+#TODO 增加非numba的似然函数
 @jit(nopython = True)
-def loglikelihood(theta_f,theta_pi,data_numpy):
+def loglikelihood_numba(theta_f,theta_pi,data_numpy):
     """
     计算似然函数值, 通过numba加速
 
@@ -301,6 +388,7 @@ def loglikelihood(theta_f,theta_pi,data_numpy):
     """
     sum_llh = 0
     for sample in data_numpy:
+        # 构造数据对应的转移矩阵，只保留存在缺失商品的行，缺失商品的列设为0
         trans_pi = theta_pi[np.isnan(sample),:]
         trans_pi[:,np.isnan(sample)] = 0
         
@@ -329,3 +417,4 @@ def loglikelihood(theta_f,theta_pi,data_numpy):
         sum_llh += llh
         
     return -sum_llh
+
