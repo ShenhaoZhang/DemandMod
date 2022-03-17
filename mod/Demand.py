@@ -314,7 +314,7 @@ class Demand:
             ax0.errorbar(
                 x    = int_md,
                 y    = np.arange(len(int_up)),
-                xerr = [int_up - int_md, int_md - int_dw],
+                xerr = [int_md - int_dw, int_up - int_md],
                 fmt='o'
             )
             if SimSale is not None:
@@ -322,7 +322,7 @@ class Demand:
                             y     = np.arange(len(int_up)),
                             color = 'red')
         
-        return int_up,int_dw
+        return int_up,int_dw,theta_list
     
     def score(self,SimSale,interval=0.1,plot=False,plot_ci=False):
         """
@@ -363,6 +363,7 @@ class Demand:
             ax2.axline([0,interval],slope=1,color='b',ls='--')
             ax2.set_xlabel('goods_pi')
             ax2.set_ylabel('goods_pi_hat')
+            ax2.set_title('R Square = '+ np.str(np.round(R2,2)))
         
         return R2
 
