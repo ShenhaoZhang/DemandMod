@@ -33,11 +33,11 @@ class SimSale:
         self.goods_f       = None
         self.goods_pi      = None
         
-        self.generate_attr_param()
-        self.generate_goods_param()
+        self.__generate_attr_param()
+        self.__generate_goods_param()
         
     
-    def generate_attr_param(self):
+    def __generate_attr_param(self):
         """
         属性选择及转移参数
         """
@@ -79,7 +79,7 @@ class SimSale:
             
         self.attr_theta = np.append(self.attr_f_theta,self.attr_pi_theta)
 
-    def generate_goods_param(self):
+    def __generate_goods_param(self):
         """
         通过属性计算商品的选择及转移参数
         """
@@ -165,4 +165,4 @@ class SimSale:
             obs_list.append(obs)
         sale = pd.concat(obs_list)
         sale = sale.reindex(self.goods_f.index,axis=1)
-        return sale
+        return sale.reset_index(drop=True)
