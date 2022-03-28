@@ -10,10 +10,10 @@ from numba import jit
 # from numdifftools import Hessian
 
 class Demand:
-    def __init__(self,data,goods_attr,llh_method='numba') -> None:
+    def __init__(self,data,goods_attr,numba=True) -> None:
         self.data       = data
         self.goods_attr = goods_attr # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
-        self.llh_method = llh_method
+        self.numba      = numba
         
         self.attr_name         = None
         self.attr_type         = None
@@ -89,7 +89,7 @@ class Demand:
             attr_trans.append(reduce(lambda x,y:pd.concat([x,y],axis=0),df_list))
         self.attr_trans = attr_trans
     
-    def init_theta(self,theta_flatten,reparam=True,to_goods=True,goods_to_numpy=True):
+    def init_theta(self,theta_flatten,reparam=True,to_goods=True,goods_to_Pandas=False):
         """
         初始化待估计的参数,将theta列表转化为商品选择概率向量和商品转移概率矩阵
 
@@ -153,22 +153,19 @@ class Demand:
         
         if to_goods is True:
             # 通过【属性】的选择概率和转移概率 转换为 【商品】的选择概率和转移概率
+            
             ## 将属性概率笛卡尔积并相乘后得到商品的选择概率
-            theta_f = list(map(lambda l:reduce(lambda x,y:x*y,l),product(*theta_f_list)))
-            theta_f = pd.Series(data=theta_f,index=self.goods_type)
-            #FIXME 取消pandas
-                
+            theta_f = np.array(list(map(lambda l:reduce(lambda x,y:x*y,l),product(*theta_f_list))))
             ## 将属性转移概率转换为商品转移概率（使用克罗内克积）
             theta_pi = reduce(np.kron, theta_pi_list)
-            theta_pi = pd.DataFrame(data=theta_pi, 
-                                    columns=self.goods_type, 
-                                    index=self.goods_type)
-            #FIXME 改成goods_to_Series
-            if goods_to_numpy is True:
-                theta_f  = theta_f.to_numpy()
-                theta_pi = theta_pi.to_numpy()
+            
+            ## 将选择概率和转移概率以Pandas数据结构展示，用于展示，不实际计算
+            if goods_to_Pandas is True:
+                theta_f  = pd.Series(data=theta_f,index=self.goods_type)
+                theta_pi = pd.DataFrame(data=theta_pi, columns=self.goods_type, index=self.goods_type)
             
             return theta_f,theta_pi
+        
         else :
             #【属性】的选择概率和转移概率
             return theta_f_list,theta_pi_flatten_list
@@ -191,15 +188,14 @@ class Demand:
         data = self.data.to_numpy()
         
         # 两种途径计算似然函数，numba计算效率高，python适应性强
-        if self.llh_method == 'numba':
+        if self.numba is True:
             loglikelihood = loglikelihood_numba
         else:
             pass
             # loglikelihood = loglikelihood_python
             
-        llh = loglikelihood(theta_f = theta_f,
-                            theta_pi = theta_pi,
-                            data_numpy = data)
+        llh = loglikelihood(theta_f = theta_f, theta_pi = theta_pi, data_numpy = data)
+        
         return llh
     
     def fit(self,method='dual_annealing',**kwargs):
@@ -270,7 +266,7 @@ class Demand:
         tuple
             置信区间的上界和下界
         """
-        
+        # TODO 使用并行化计算，考虑从Method中移出，单独写成函数
         # 保存对象原始属性
         org_theta_hat          = self.theta_hat
         org_theta_hat_attr_f   = self.theta_hat_attr_f
@@ -367,7 +363,6 @@ class Demand:
         
         return R2
 
-#TODO 增加非numba的似然函数
 @jit(nopython = True)
 def loglikelihood_numba(theta_f,theta_pi,data_numpy):
     """
