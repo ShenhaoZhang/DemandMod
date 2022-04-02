@@ -10,15 +10,18 @@ from numba import jit
 # from numdifftools import Hessian
 
 class Demand:
-    def __init__(self,data,goods_attr,numba=True) -> None:
+    """
+    需求估计模型
+    """
+    def __init__(self, data:pd.DataFrame, goods_attr:dict, numba:bool=True) -> None:
         self.data       = data
         self.goods_attr = goods_attr # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
         self.numba      = numba
         
-        self.attr_name         = None
-        self.attr_type         = None
-        self.attr_type_flatten = None
-        self.goods_type        = None
+        self.attr_name         = None # ['price', 'size']
+        self.attr_type         = None # [['price_l','price_s'], ['size_l','size_s']]
+        self.attr_type_flatten = None # ['price_l','price_s','size_l','size_s']
+        self.goods_type        = None # ['price_l * size_l', 'price_l * size_m']
         self.attr_trans        = None
         
         self._init_attr()
@@ -38,22 +41,17 @@ class Demand:
         """
         初始化属性
         """
-        # ['price', 'size']
+        
         self.attr_name         = list(self.goods_attr)
-        
-        # [['price_l','price_s'], ['size_l','size_s']]
         self.attr_type         = [list(map(lambda x:name+'_'+x,level)) for name,level in self.goods_attr.items()] 
-        
-        # ['price_l','price_s','size_l','size_s']
         self.attr_type_flatten = list(chain(*self.attr_type))
-        
-        #['price_l * size_l', 'price_l * size_m']
         self.goods_type        = list(map(lambda attrs:reduce(lambda x,y:x+'*'+y,attrs),product(*self.attr_type)))
     
     def _init_attr_trans(self):
         """
         统计数据中各属性的转移频数矩阵,当频数较低时,代表估计的参数可能会不准确
         """
+        
         attr_count = len(self.attr_type)
         attr_trans = list()
         for attr in range(attr_count):
@@ -110,6 +108,7 @@ class Demand:
             theta_f为商品的选择概率向量 
             theta_pi为商品间的转移概率矩阵 
         """
+        
         # 避免优化的过程中theta_flatten变为ndarray
         theta_flatten = list(theta_flatten)
         
@@ -184,6 +183,7 @@ class Demand:
         float
             似然函数值
         """
+        
         theta_f,theta_pi = self.init_theta(theta_flatten = theta_flatten)
         data = self.data.to_numpy()
         
@@ -212,6 +212,7 @@ class Demand:
         dict
             scipy的最优化结果
         """
+        
         f_flatten_len = len(self.attr_type_flatten)
         pi_flatten_len = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
         
@@ -260,12 +261,19 @@ class Demand:
             计算置信区间的方法
         level : float, optional
             置信水平, by default 0.95
+        plot : bool, optional
+            返回图形, by default True
+        bootstrap_n : int, optional
+            Bootstrap的抽烟次数, by default 10
+        SimSale : _type_, optional
+            实例化的SimSale对象, by default None
 
         Returns
         -------
         tuple
             置信区间的上界和下界
         """
+        
         # TODO 使用并行化计算，考虑从Method中移出，单独写成函数
         # 保存对象原始属性
         org_theta_hat          = self.theta_hat
@@ -329,6 +337,7 @@ class Demand:
         SimSale : SimSale对象
             模拟的数据对象
         """
+        
         # 属性转移概率参数
         x_attr_pi_theta = SimSale.attr_pi_theta
         y_attr_pi_theta_hat = np.array(self.theta_hat_attr_pi).flatten()
@@ -382,6 +391,7 @@ def loglikelihood_numba(theta_f,theta_pi,data_numpy):
     float
         似然函数值
     """
+    
     sum_llh = 0
     for sample in data_numpy:
         # 构造数据对应的转移矩阵，只保留存在缺失商品的行，缺失商品的列设为0
