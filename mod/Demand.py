@@ -169,6 +169,59 @@ class Demand:
             #【属性】的选择概率和转移概率
             return theta_f_list,theta_pi_flatten_list
     
+    @staticmethod
+    @jit(nopython = True)
+    def loglikelihood_numba(theta_f,theta_pi,data_numpy):
+        """
+        计算似然函数值, 通过numba加速
+
+        Parameters
+        ----------
+        theta_f : ndarray
+            直接选择某个商品的概率
+        theta_pi : ndarray
+            属性之间的转移概率
+        data_numpy : ndarray
+            样本数据
+
+        Returns
+        -------
+        float
+            似然函数值
+        """
+        
+        sum_llh = 0
+        for sample in data_numpy:
+            # 构造数据对应的转移矩阵，只保留存在缺失商品的行，缺失商品的列设为0
+            trans_pi = theta_pi[np.isnan(sample),:]
+            trans_pi[:,np.isnan(sample)] = 0
+            
+            # 转移矩阵只保留每行最大的元素
+            trans_pi_max = np.zeros_like(trans_pi)
+            row_indices = np.arange(trans_pi.shape[0])
+            col_indices = np.arange(trans_pi.shape[1])
+            col_max_indices = np.argmax(trans_pi,axis=1)
+            
+            for i in row_indices:
+                col_max_index = col_max_indices[i]
+                for j in col_indices:
+                    if j == col_max_index:
+                        trans_pi_max[i,j] = np.max(trans_pi[i])
+                    else :
+                        pass
+            
+            trans_f = np.dot(theta_f[np.isnan(sample)],trans_pi_max)
+            
+            theta_f_total = theta_f + trans_f
+            theta_f_total[np.isnan(sample)] = 0
+            theta_f_total = theta_f_total[~np.isnan(sample)]
+            sample = sample[~np.isnan(sample)] 
+            
+            llh = np.sum(sample*np.log(theta_f_total)) - np.sum(sample)*np.log(np.sum(theta_f_total))
+            sum_llh += llh
+            
+        return -sum_llh
+    
     def get_loglikelihood(self,theta_flatten):
         """
         计算对数似然函数
@@ -189,7 +242,7 @@ class Demand:
         
         # 两种途径计算似然函数，numba计算效率高，python适应性强
         if self.numba is True:
-            loglikelihood = loglikelihood_numba
+            loglikelihood = Demand.loglikelihood_numba
         else:
             pass
             # loglikelihood = loglikelihood_python
@@ -407,56 +460,4 @@ class Demand:
             ax2.set_title('R Square = '+ np.str(np.round(R2,2)))
         
         return R2
-
-@jit(nopython = True)
-def loglikelihood_numba(theta_f,theta_pi,data_numpy):
-    """
-    计算似然函数值, 通过numba加速
-
-    Parameters
-    ----------
-    theta_f : ndarray
-        直接选择某个商品的概率
-    theta_pi : ndarray
-        属性之间的转移概率
-    data_numpy : ndarray
-        样本数据
-
-    Returns
-    -------
-    float
-        似然函数值
-    """
-    
-    sum_llh = 0
-    for sample in data_numpy:
-        # 构造数据对应的转移矩阵，只保留存在缺失商品的行，缺失商品的列设为0
-        trans_pi = theta_pi[np.isnan(sample),:]
-        trans_pi[:,np.isnan(sample)] = 0
-        
-        # 转移矩阵只保留每行最大的元素
-        trans_pi_max = np.zeros_like(trans_pi)
-        row_indices = np.arange(trans_pi.shape[0])
-        col_indices = np.arange(trans_pi.shape[1])
-        col_max_indices = np.argmax(trans_pi,axis=1)
-        
-        for i in row_indices:
-            col_max_index = col_max_indices[i]
-            for j in col_indices:
-                if j == col_max_index:
-                    trans_pi_max[i,j] = np.max(trans_pi[i])
-                else :
-                    pass
-        
-        trans_f = np.dot(theta_f[np.isnan(sample)],trans_pi_max)
-        
-        theta_f_total = theta_f + trans_f
-        theta_f_total[np.isnan(sample)] = 0
-        theta_f_total = theta_f_total[~np.isnan(sample)]
-        sample = sample[~np.isnan(sample)] 
-        
-        llh = np.sum(sample*np.log(theta_f_total)) - np.sum(sample)*np.log(np.sum(theta_f_total))
-        sum_llh += llh
-        
-    return -sum_llh
 
