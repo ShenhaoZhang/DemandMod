@@ -251,6 +251,42 @@ class Demand:
         
         return self.theta_hat
     
+    def fit_skopt(self,**kwargs):
+        """
+        模型拟合,估计参数
+
+        Parameters
+        ----------
+        method : str, optional
+            最优化方法,见scipy的globel optim, by default 'dual_annealing'
+
+        Returns
+        -------
+        dict
+            scipy的最优化结果
+        """
+        from skopt.optimizer import gp_minimize
+        from skopt.space import Real
+        
+        f_flatten_len = len(self.attr_type_flatten)
+        pi_flatten_len = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
+        
+        space = []
+        for i in range(f_flatten_len+pi_flatten_len):
+            if i + 1 <= f_flatten_len:
+                space.append(Real(-1,1))
+            else:
+                space.append(Real(-3,3))
+        
+        opt = gp_minimize(self.get_loglikelihood,space,**kwargs)
+        self.theta_hat          = opt
+        self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=True)[0]
+        self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=True)[1]
+        self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=True)[0]
+        self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=True)[1]
+        
+        return opt['x']
+    
     def conf_int(self,method='Bootstrap',level=0.95,plot=True,bootstrap_n=10,SimSale=None):
         """
         参数的置信区间
