@@ -1,57 +1,66 @@
 from itertools import product,accumulate,chain
 from functools import reduce
-from joblib import Parallel, delayed
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import differential_evolution,dual_annealing,minimize
+from scipy import optimize
 from numba import jit
-# from numdifftools import Hessian
 
 class Demand:
     """
     需求估计模型
     """
-    def __init__(self, data:pd.DataFrame, goods_attr:dict, numba:bool=True) -> None:
-        self.data       = data
-        self.goods_attr = goods_attr # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
+    def __init__(self, data:pd.DataFrame, numba:bool=True) -> None:
+        self.data       = data.sort_index(axis=1)
         self.numba      = numba
         
-        self.attr_name         = None # ['price', 'size']
-        self.attr_type         = None # [['price_l','price_s'], ['size_l','size_s']]
-        self.attr_type_flatten = None # ['price_l','price_s','size_l','size_s']
-        self.goods_type        = None # ['price_l * size_l', 'price_l * size_m']
-        self.attr_trans        = None
+        self.goods_attr             = None # {'price': ['l', 'm', 's'], 'size': ['l', 'm', 's']}
+        self.attr_name              = None # ['price', 'size']
+        self.attr_type              = None # [['price_l','price_s'], ['size_l','size_s']]
+        self.attr_type_flatten      = None # ['price_l','price_s','size_l','size_s']
+        self.goods_type             = None # ['price_l * size_l', 'price_l * size_m']
+        self.index_flatten_theta_f  = None
+        self.index_flatten_theta_pi = None
+        self.attr_trans             = None
         
         self._init_attr()
         self._init_attr_trans()
         
-        self.theta_hat          = None
-        self.theta_hat_attr_f   = None
-        self.theta_hat_attr_pi  = None
-        self.theta_hat_goods_f  = None
-        self.theta_hat_goods_pi = None
+        self.fit_result         = None # scipy中的优化结果
+        self.theta_hat_attr_f   = None # 属性的选择概率
+        self.theta_hat_attr_pi  = None # 属性的转移概率
+        self.theta_hat_goods_f  = None # 商品的选择概率
+        self.theta_hat_goods_pi = None # 商品的转移概率
         
-    #TODO 增加data的初始化方法
-    #TODO 增加通过先验确定转移参数
-    #TODO 通过似然函数度量参数的不确定性
-    
     def _init_attr(self):
         """
         初始化属性
         """
+        # 从数据中初始化商品的属性
+        attr_lvl = [attr_lvl for attr_lvl_list in self.data.columns.str.split('*').to_list() for attr_lvl in attr_lvl_list]
+        attr_lvl = list(set(attr_lvl))
+        attr_lvl_df = pd.Series(attr_lvl).str.split('_',expand=True).set_axis(['attr','lvl'],axis=1).sort_values(['attr','lvl'])
+        self.goods_attr = attr_lvl_df.groupby('attr').agg(list).loc[:,'lvl'].to_dict()
         
+        # 由商品属性衍生出的属性
         self.attr_name         = list(self.goods_attr)
         self.attr_type         = [list(map(lambda x:name+'_'+x,level)) for name,level in self.goods_attr.items()] 
         self.attr_type_flatten = list(chain(*self.attr_type))
         self.goods_type        = list(map(lambda attrs:reduce(lambda x,y:x+'*'+y,attrs),product(*self.attr_type)))
+        
+        # theta_flatten中涉及各属性的选择概率的索引，如[0,2,4]
+        self.index_flatten_theta_f = map(lambda x:len(x),self.attr_type)
+        self.index_flatten_theta_f = [0]+list(accumulate(self.index_flatten_theta_f,func = lambda x,y:x+y))
+        # theta_flatten中涉及各属性间的转移概率的索引,如[4,6,8]
+        self.index_flatten_theta_pi = map(lambda x:len(x)**2-len(x),self.attr_type)
+        self.index_flatten_theta_pi = list(accumulate(self.index_flatten_theta_pi,func = lambda x,y:x+y))
+        self.index_flatten_theta_pi = [self.index_flatten_theta_f[-1]] + list(map(lambda x:x+self.index_flatten_theta_f[-1],self.index_flatten_theta_pi))
     
     def _init_attr_trans(self):
         """
         统计数据中各属性的转移频数矩阵,当频数较低时,代表估计的参数可能会不准确
         """
-        
         attr_count = len(self.attr_type)
         attr_trans = list()
         for attr in range(attr_count):
@@ -87,7 +96,7 @@ class Demand:
             attr_trans.append(reduce(lambda x,y:pd.concat([x,y],axis=0),df_list))
         self.attr_trans = attr_trans
     
-    def init_theta(self,theta_flatten,reparam=True,to_goods=True,goods_to_Pandas=False):
+    def init_theta(self,theta_flatten,reparam=True,attrs_to_Pandas=False,to_goods=True,goods_to_Pandas=False):
         """
         初始化待估计的参数,将theta列表转化为商品选择概率向量和商品转移概率矩阵
 
@@ -112,28 +121,18 @@ class Demand:
         # 避免优化的过程中theta_flatten变为ndarray
         theta_flatten = list(theta_flatten)
         
-        # 从theta_flatten中提取相应部分的内容
-        ## theta_flatten中涉及各属性的选择概率的索引
-        theta_f_index = map(lambda x:len(x),self.attr_type)
-        theta_f_index = [0]+list(accumulate(theta_f_index,func = lambda x,y:x+y))
-        
-        ## theta_flatten中涉及各属性间的转移概率的索引
-        theta_pi_index = map(lambda x:len(x)**2-len(x),self.attr_type)
-        theta_pi_index = list(accumulate(theta_pi_index,func = lambda x,y:x+y))
-        theta_pi_index = [theta_f_index[-1]] + list(map(lambda x:x+theta_f_index[-1],theta_pi_index))
-        
         ## 通过索引分割theta_flatten
         theta_f_list          = [] # 属性选择概率
         theta_pi_flatten_list = [] # 属性转移概率
-        for i in range(len(theta_f_index)-1):
-            theta_f = theta_flatten[theta_f_index[i]:theta_f_index[i+1]]
-            theta_pi = theta_flatten[theta_pi_index[i]:theta_pi_index[i+1]]
-            
+        for i in range(len(self.index_flatten_theta_f)-1):
+            theta_f = theta_flatten[self.index_flatten_theta_f[i]:self.index_flatten_theta_f[i+1]]
+            theta_pi = theta_flatten[self.index_flatten_theta_pi[i]:self.index_flatten_theta_pi[i+1]]
             # 重参数 reparametrizing
-            if reparam:
+            if reparam is True:
                 theta_f = np.exp(theta_f) / np.sum(np.exp(theta_f))
-                theta_pi = np.exp(theta_pi) / (1 + np.exp(theta_pi))
-                
+                # theta_pi = np.exp(theta_pi) / (1 + np.exp(theta_pi))
+            if attrs_to_Pandas is True:
+                theta_f = pd.Series(data=theta_f,index=self.attr_type[i])
             theta_f_list.append(theta_f)
             theta_pi_flatten_list.append(theta_pi)
         
@@ -152,7 +151,6 @@ class Demand:
         
         if to_goods is True:
             # 通过【属性】的选择概率和转移概率 转换为 【商品】的选择概率和转移概率
-            
             ## 将属性概率笛卡尔积并相乘后得到商品的选择概率
             theta_f = np.array(list(map(lambda l:reduce(lambda x,y:x*y,l),product(*theta_f_list))))
             ## 将属性转移概率转换为商品转移概率（使用克罗内克积）
@@ -266,16 +264,20 @@ class Demand:
             scipy的最优化结果
         """
         
-        f_flatten_len = len(self.attr_type_flatten)
-        pi_flatten_len = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
-        
-        bounds_up = [1]*f_flatten_len + [3]*pi_flatten_len
-        bounds_dw = [-1]*f_flatten_len + [-3]*pi_flatten_len
-        bounds = list(zip(bounds_dw,bounds_up))
-        x0 = np.zeros(shape=f_flatten_len+pi_flatten_len)+0.1
+        f_flatten_len     = len(self.attr_type_flatten)
+        pi_flatten_len    = sum(list(map(lambda x:len(x)**2-len(x),self.attr_type)))
+        theta_flatten_len = f_flatten_len + pi_flatten_len
+        # 边界
+        bounds_up = [1]*f_flatten_len + [0.99]*pi_flatten_len
+        bounds_dw = [-1]*f_flatten_len + [0.01]*pi_flatten_len
+        bounds    = list(zip(bounds_dw,bounds_up))
+        # 初始值
+        x0_theta_hat_f  = [f for f_list in map(lambda x:x.to_list(),self.guess_theta_f()) for f in f_list]
+        x0_theta_hat_pi = np.zeros(shape=pi_flatten_len)+0.1
+        x0              = np.append(x0_theta_hat_f,x0_theta_hat_pi)
         
         if method == 'differential_evolution':
-            opt = differential_evolution(
+            opt = optimize.differential_evolution(
                 func    = self.get_loglikelihood,
                 x0      = x0,
                 bounds  = bounds,
@@ -283,27 +285,25 @@ class Demand:
                 **kwargs)
         
         elif method == 'dual_annealing':
-            opt = dual_annealing(
+            opt = optimize.dual_annealing(
                 func   = self.get_loglikelihood,
                 bounds = bounds,
                 **kwargs
             )
         else:
-            opt = minimize(
+            opt = optimize.minimize(
                 fun    = self.get_loglikelihood,
                 x0     = x0,
                 bounds = bounds,
                 **kwargs
             )
         
-        self.theta_hat          = opt
+        self.fit_result         = opt
         self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=True)[0]
         self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=True)[1]
         self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=True)[0]
         self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=True)[1]
         
-        return self.theta_hat
-    
     def fit_skopt(self,**kwargs):
         """
         模型拟合,估计参数
@@ -329,16 +329,92 @@ class Demand:
             if i + 1 <= f_flatten_len:
                 space.append(Real(-1,1))
             else:
-                space.append(Real(-3,3))
+                space.append(Real(0,1))
         
         opt = gp_minimize(self.get_loglikelihood,space,**kwargs)
-        self.theta_hat          = opt
+        self.fit_result         = opt
         self.theta_hat_attr_f   = self.init_theta(opt['x'],to_goods=False,reparam=True)[0]
         self.theta_hat_attr_pi  = self.init_theta(opt['x'],to_goods=False,reparam=True)[1]
         self.theta_hat_goods_f  = self.init_theta(opt['x'],to_goods=True,reparam=True)[0]
         self.theta_hat_goods_pi = self.init_theta(opt['x'],to_goods=True,reparam=True)[1]
         
         return opt['x']
+    
+    def summary(self,SimSale=None):
+        """
+        模型的总结
+
+        Parameters
+        ----------
+        SimSale : SimSale对象, optional
+            模拟的销售数据, by default None
+        """
+        if self.fit_result is None:
+            raise Exception('Model Need Fit')
+        print('#'*20+' 1.属性的选择概率 '+'#'*20)
+        attrs_f_list = self.init_theta(self.fit_result['x'],attrs_to_Pandas=True,to_goods=False,reparam=True)[0]
+        attrs_f_list_guess = self.guess_theta_f()
+        for attr_index in range(len(attrs_f_list)):
+            attrs_df = (
+                pd.concat([attrs_f_list[attr_index],attrs_f_list_guess[attr_index]],axis=1)
+                .set_axis(['Estimate','Guess'],axis=1)
+                .assign(EG_Diff = lambda dt:dt.Estimate - dt.Guess))
+            if SimSale is not None:
+                attrs_df = attrs_df.assign(
+                    Real = lambda dt:SimSale.attr_f_list[attr_index].to_numpy(),
+                    ER_Diff = lambda dt:dt.Estimate - dt.Real,
+                    GR_Diff = lambda dt:dt.Guess - dt.Real)
+            print(attrs_df)
+
+        if SimSale is not None:
+            print('#'*20+' 2.属性和商品的转移概率 '+'#'*20)
+            self.score(SimSale=SimSale,plot=True)
+        
+    def predict(self,data:pd.DataFrame):
+        """
+        通过拟合得到的选择概率及转移概率，预测商品如果在售时的销量
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            实际的销售数据
+
+        Returns
+        -------
+        pd.DataFrame
+            预测的销售数据
+
+        """
+        #TODO 预测全量数据
+        if self.fit_result is None:
+            raise Exception('Model Need Fit')
+        # 数据验证
+        ## 验证是否存在需要预测的值
+        if data.isna().any(axis=1).to_numpy()[0] is False:
+            return data
+        data = data.sort_index(axis=1)
+        ## 验证行数和列数
+        n_row,n_col = data.shape
+        if (n_row != 1) or (n_col != len(self.goods_type)):
+            raise Exception('Wrong Data Shape')
+        ## 验证列名是否相同
+        if data.columns.to_list() != self.goods_type:
+            raise Exception('Wrong Data Columns')
+        
+        # 估计如果所有商品类型都在售的情况下的总销量
+        ## 在售品的索引及未售品的索引
+        data_sr = data.squeeze()
+        index_unsale = data_sr.isna().to_list()
+        index_sale   = data_sr.notna().to_list()
+        goods_f_unsale = self.theta_hat_goods_f[index_unsale]
+        goods_f_sale = self.theta_hat_goods_f[index_sale]
+        goods_pi_unsale_to_sale = self.theta_hat_goods_pi[index_unsale][:,index_sale]
+        goods_pi_unsale_to_sale = self.get_trans_prob(goods_pi_unsale_to_sale)
+        total_sale = data_sr.to_numpy()[index_sale] / (goods_f_sale + np.dot(goods_f_unsale , goods_pi_unsale_to_sale))
+        total_sale = np.mean(total_sale)
+        
+        predict_sale = pd.DataFrame(data=dict(zip(self.goods_type,total_sale*self.theta_hat_goods_f)),index=[0])
+        return predict_sale.round().astype('int')
     
     def conf_int(self,method='Bootstrap',level=0.95,plot=True,bootstrap_n=10,SimSale=None):
         """
@@ -365,7 +441,7 @@ class Demand:
         
         # TODO 使用并行化计算，考虑从Method中移出，单独写成函数
         # 保存对象原始属性
-        org_theta_hat          = self.theta_hat
+        org_fit_result         = self.fit_result
         org_theta_hat_attr_f   = self.theta_hat_attr_f
         org_theta_hat_attr_pi  = self.theta_hat_attr_pi
         org_theta_hat_goods_f  = self.theta_hat_goods_f
@@ -396,7 +472,7 @@ class Demand:
             pass
         
         # 回复对象原始属性
-        self.theta_hat          = org_theta_hat
+        self.fit_result         = org_fit_result
         self.theta_hat_attr_f   = org_theta_hat_attr_f
         self.theta_hat_attr_pi  = org_theta_hat_attr_pi
         self.theta_hat_goods_f  = org_theta_hat_goods_f
@@ -428,8 +504,8 @@ class Demand:
         """
         
         # 属性转移概率参数
-        x_attr_pi_theta = SimSale.attr_pi_theta
-        y_attr_pi_theta_hat = np.array(self.theta_hat_attr_pi).flatten()
+        x_attr_pi_theta     = SimSale.attr_pi_theta
+        y_attr_pi_theta_hat = [pi for pi_list in self.theta_hat_attr_pi for pi in pi_list]
         
         # 商品转移概率参数
         x_goods_pi_theta     = SimSale.goods_pi.to_numpy().flatten()
@@ -437,7 +513,7 @@ class Demand:
         
         SSR = np.sum((x_goods_pi_theta-y_goods_pi_theta_hat)**2)
         SST = np.sum((y_goods_pi_theta_hat-np.mean(y_goods_pi_theta_hat))**2)
-        R2 = 1 - SSR / SST
+        R2  = 1 - SSR / SST
         
         if plot is True:
             
@@ -458,6 +534,29 @@ class Demand:
             ax2.set_xlabel('goods_pi')
             ax2.set_ylabel('goods_pi_hat')
             ax2.set_title('R Square = '+ np.str(np.round(R2,2)))
-        
-        return R2
+        else:
+            return f'score:{R2}'
+    
+    def guess_theta_f(self):
+        guess_theta_f_list = []
+        for attr_index in range(len(self.attr_type)):
+            data = self.data.copy()
+            data.columns = data.columns.str.split('*').map(lambda x:x[attr_index])
+            attr_sale = data.transpose().groupby(by=lambda x:x).agg(np.sum).transpose().sum()
+            attr_sale_pct = attr_sale / attr_sale.sum()
+            guess_theta_f_list.append(attr_sale_pct)
+        return guess_theta_f_list
+    
+    @staticmethod
+    def get_trans_prob(matrix):
+        matrix_max = np.zeros_like(matrix)
+        n_row,n_col = matrix_max.shape
+        for row_index in range(n_row):
+            col_max_index = np.argmax(matrix[row_index])
+            for col_index in range(n_col):
+                if col_index == col_max_index:
+                    matrix_max[row_index,col_index] = matrix[row_index,col_index]
+                else:
+                    pass
+        return matrix_max
 

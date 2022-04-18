@@ -166,3 +166,9 @@ class SimSale:
         sale = pd.concat(obs_list)
         sale = sale.reindex(self.goods_f.index,axis=1)
         return sale.reset_index(drop=True)
+
+if __name__ == '__main__':
+    ss = SimSale(level_size=[2,2],seed=1)
+    print(ss.goods_f)
+    print(ss.goods_pi)
+    print(ss.generate_sale(size=100,lam=100,un_ava_mix=False,un_ava_frac=0.25).mean())
