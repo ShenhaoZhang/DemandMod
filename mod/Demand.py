@@ -30,11 +30,13 @@ class Demand:
         self.index_eft_attr_pi          = None # [[True,False],[False,True]] 仅包含self.attr_trans中非对角线元素
         self.index_eft_flatten_attr_pi  = None # [True,False,False,True]
         self.index_eft_flatten_goods_pi = None # [True,False,False,True]
+        self.attr_sale_pct              = None
         self._init_attr_trans()
         self.check_data_validation()
         
         self.only_effect            = True # 仅估计【可估计的转移概率】
-        self.fit_result             = None # scipy中的优化结果
+        self.use_guess_f            = False
+        self.fit_result             = None # 优化结果
         self.theta_hat_attr_flatten = None # 属性的概率参数（选择概率+转移概率）
         self.theta_hat_attr_f       = None # 属性的选择概率
         self.theta_hat_attr_pi      = None # 属性的转移概率
@@ -129,8 +131,33 @@ class Demand:
         self.index_eft_flatten_goods_pi = index_eft_goods_pi.flatten()
     
     def check_data_validation(self):
-        #TODO 验证数据中是否存在未曾销售过的属性,会严重影响拟合结果
-        pass
+        """
+        数据验证
+
+        Raises
+        ------
+        Exception
+            存在无销售的属性层级
+        """
+        # 验证是否存在无销售或销售占比小的属性层级
+        self.attr_sale_pct = []
+        no_sale_attr       = []
+        unbalance_attr     = []
+        for attr_index in range(len(self.attr_name)):
+            attr_columns_label = self.data.columns.str.split('*').map(lambda x:x[attr_index])
+            data               = self.data.copy()
+            data.columns       = attr_columns_label
+            attr_sale          = data.transpose().groupby(lambda x:x).agg(np.sum).transpose().sum()
+            attr_sale_pct      = attr_sale / attr_sale.sum()
+            self.attr_sale_pct.append(attr_sale_pct)
+            unbalance_attr.append(attr_sale_pct.loc[lambda x:x<0.1].index.to_list())
+            no_sale_attr.append(attr_sale_pct.loc[lambda x:x==0].index.to_list())
+        no_sale_attr = [attr for attr_list in no_sale_attr for attr in attr_list]
+        unbalance_attr = [attr for attr_list in unbalance_attr for attr in attr_list]
+        if len(no_sale_attr) > 0:
+            raise Exception(f'ERROR:存在无销售的属性层级{no_sale_attr}，应首先从数据中剔除，否则严重影响拟合效果')
+        if len(unbalance_attr) > 0:
+            print(f'WARN: 属性层级{unbalance_attr}的销售量占比较低(<10%)，参数估计可能存在较大的误差，明细见self.attr_sale_pct')
     
     def init_theta(self,theta_flatten,reparam=True,attrs_to_Pandas=False,to_goods=True,goods_to_Pandas=False):
         """
@@ -163,8 +190,8 @@ class Demand:
         for i in range(len(self.index_flatten_theta_f)-1):
             theta_f = theta_flatten[self.index_flatten_theta_f[i]:self.index_flatten_theta_f[i+1]]
             theta_pi = theta_flatten[self.index_flatten_theta_pi[i]:self.index_flatten_theta_pi[i+1]]
-            # 重参数 reparametrizing
-            if reparam is True:
+            # reparametrizing
+            if reparam is True and self.use_guess_f is False:
                 theta_f = np.exp(theta_f) / np.sum(np.exp(theta_f))
                 # theta_pi = np.exp(theta_pi) / (1 + np.exp(theta_pi))
             if attrs_to_Pandas is True:
@@ -286,7 +313,7 @@ class Demand:
         
         return llh
     
-    def fit(self,method='dual_annealing',only_effect=True,**kwargs):
+    def fit(self,method='dual_annealing',only_effect=True,use_guess_f=False,**kwargs):
         """
         模型拟合,估计参数
 
@@ -301,6 +328,8 @@ class Demand:
             scipy的最优化结果
         """
         self.only_effect = only_effect
+        self.use_guess_f = use_guess_f
+        
         theta_flatten_len = self.attr_f_flatten_len + self.attr_pi_flatten_len
         # 边界
         bounds_up = [] # 参数上界
@@ -309,8 +338,11 @@ class Demand:
             
             # 选择概率参数
             if theta_index < self.attr_f_flatten_len:
-                bounds_up.append(1)
-                bounds_dw.append(-1)
+                if self.use_guess_f:
+                    pass
+                else:
+                    bounds_up.append(1)
+                    bounds_dw.append(-1)
             
             # 转移概率参数
             if theta_index >= self.attr_f_flatten_len:
@@ -331,7 +363,14 @@ class Demand:
         # 初始值
         x0_theta_hat_f  = [f for f_list in map(lambda x:x.to_list(),self.guess_theta_f()) for f in f_list]
         x0_theta_hat_pi = np.zeros(shape=self.attr_pi_flatten_len)+0.1
-        x0              = np.append(x0_theta_hat_f,x0_theta_hat_pi[self.index_eft_flatten_attr_pi])
+        # 当仅估计有效的属性转移概率时，调整x0的长度
+        x0 = [] if self.use_guess_f else x0_theta_hat_f
+        # 当仅估计有效的属性转移概率时，调整x0的长度
+        if self.only_effect:
+            x0 = np.append(x0,x0_theta_hat_pi[self.index_eft_flatten_attr_pi])
+        else:
+            x0 = np.append(x0,x0_theta_hat_pi)
+        
         if method == 'differential_evolution':
             opt = optimize.differential_evolution(
                 func    = self.get_loglikelihood,
@@ -339,15 +378,16 @@ class Demand:
                 bounds  = bounds,
                 workers = -1,
                 **kwargs )
-        
+            
         elif method == 'dual_annealing':
             opt = optimize.dual_annealing(
-                func   = self.get_loglikelihood,
-                bounds = bounds,
-                x0     = x0,
-                maxiter=2000,
-                local_search_options={'method':'BFGS'},
+                func                 = self.get_loglikelihood,
+                bounds               = bounds,
+                x0                   = x0,
+                # maxiter              = 2000,
+                # local_search_options = {'method':'BFGS'},
                 **kwargs )
+            
         else:
             opt = optimize.minimize(
                 fun    = self.get_loglikelihood,
@@ -428,52 +468,74 @@ class Demand:
         if SimSale is not None:
             print('#'*20+' 2.属性和商品的转移概率 '+'#'*20)
             self.score(SimSale=SimSale,plot=True)
-        
-    def predict(self,data:pd.DataFrame):
+    
+    def predict(self,data,result_type='DataFrame'):
         """
-        通过拟合得到的选择概率及转移概率，预测商品如果在售时的销量
+        预测当各类商品上架时的销售额数据，输入的数据应为1行的DataFrame或Series
+        若需要预测多行数据：DataFrame.apply(lambda dt:self.predict(dt,result_type='Series'),axis=1)
 
         Parameters
         ----------
-        data : pd.DataFrame
-            实际的销售数据
+        data : pd.DataFrame | pd.Series
+            带缺失值的数据
+        result_type : str, optional
+            返回的数据类型，大小写不敏感，DataFrame 或 Series, by default 'DataFrame'
 
         Returns
         -------
-        pd.DataFrame
+        pd.DataFrame | pd.Series
             预测的销售数据
-
         """
-        #TODO 预测全量数据
         if self.fit_result is None:
-            raise Exception('Model Need Fit')
+            raise Exception('模型需要先拟合')
+        
         # 数据验证
-        ## 验证是否存在需要预测的值
-        if data.isna().any(axis=1).to_numpy()[0] is False:
-            return data
-        data = data.sort_index(axis=1)
+        ## 数据类型
+        if isinstance(data,pd.Series):
+            data = data.to_frame().transpose()
+        elif not isinstance(data,pd.DataFrame):
+            raise Exception('数据类型有误')
         ## 验证行数和列数
         n_row,n_col = data.shape
         if (n_row != 1) or (n_col != len(self.goods_type)):
-            raise Exception('Wrong Data Shape')
+            raise Exception('数据形状有误')
         ## 验证列名是否相同
         if data.columns.to_list() != self.goods_type:
-            raise Exception('Wrong Data Columns')
+            raise Exception('数据的属性有误')
+        series = data.sort_index(axis=1).squeeze()
         
-        # 估计如果所有商品类型都在售的情况下的总销量
-        ## 在售品的索引及未售品的索引
-        data_sr = data.squeeze()
-        index_unsale = data_sr.isna().to_list()
-        index_sale   = data_sr.notna().to_list()
-        goods_f_unsale = self.theta_hat_goods_f[index_unsale]
-        goods_f_sale = self.theta_hat_goods_f[index_sale]
-        goods_pi_unsale_to_sale = self.theta_hat_goods_pi[index_unsale][:,index_sale]
-        goods_pi_unsale_to_sale = self.get_trans_prob(goods_pi_unsale_to_sale)
-        total_sale = data_sr.to_numpy()[index_sale] / (goods_f_sale + np.dot(goods_f_unsale , goods_pi_unsale_to_sale))
-        total_sale = np.mean(total_sale)
+        if series.isna().any() is False:
+            # 如果待预测的数据无空值时，返回原值
+            return series
+        else:
+            # 估计如果所有商品类型都在售的情况下的总销量
+            ## 在售品的索引及未售品的索引
+            index_unsale            = series.isna().to_list()
+            index_sale              = series.notna().to_list()
+            goods_f_unsale          = self.theta_hat_goods_f[index_unsale]
+            goods_f_sale            = self.theta_hat_goods_f[index_sale]
+            goods_pi_unsale_to_sale = self.theta_hat_goods_pi[index_unsale][:,index_sale]
+            goods_pi_unsale_to_sale = self.get_trans_prob(goods_pi_unsale_to_sale)
+            
+            total_sale   = np.mean(series.to_numpy()[index_sale] / (goods_f_sale + np.dot(goods_f_unsale , goods_pi_unsale_to_sale)))
+            predict_sale = total_sale * self.theta_hat_goods_f
+            
+            # 在售品及未售品的调整
+            theta_hat_goods_pi = self.theta_hat_goods_pi.copy()
+            theta_hat_goods_pi[np.diag_indices_from(theta_hat_goods_pi)] = 0
+            theta_hat_goods_pi[:,index_unsale] = 0
+            index_sale_adj = np.sum(self.get_trans_prob(theta_hat_goods_pi[index_unsale]),axis=0).astype('bool')
+            origin_sale = series.to_numpy()
+            origin_sale[index_sale_adj] = predict_sale[index_sale_adj] # 在售品
+            origin_sale[index_unsale]   = predict_sale[index_unsale]   # 未售品
+            predict_sale = pd.Series(origin_sale,index=self.goods_type).round().astype('int')
         
-        predict_sale = pd.DataFrame(data=dict(zip(self.goods_type,total_sale*self.theta_hat_goods_f)),index=[0])
-        return predict_sale.round().astype('int')
+        if result_type.lower() == 'series':
+            return predict_sale
+        elif result_type.lower() == 'dataframe':
+            return predict_sale.to_frame().transpose()
+        else:
+            raise Exception('输出类型有误')
     
     def conf_int(self,method='Bootstrap',level=0.95,plot=True,bootstrap_n=10,SimSale=None):
         """
@@ -510,8 +572,9 @@ class Demand:
             theta_list = []
             for i in range(bootstrap_n):
                 sample_data = self.data.sample(frac=1,replace=True)
-                self.__init__(data=sample_data,goods_attr=self.goods_attr)
-                theta_list.append(self.fit().x)
+                self.__init__(data=sample_data)
+                self.fit()
+                theta_list.append(self.fit_result.x)
                 
             theta_matrix = np.column_stack(theta_list)
             
@@ -633,12 +696,17 @@ class Demand:
         np.array
             已补全的参数向量
         """
+        if self.use_guess_f:
+            guess_theta_f = np.concatenate(list(map(lambda x:x.to_numpy(),self.guess_theta_f())))
+            theta_flatten = np.append(guess_theta_f,theta_flatten)
+            
         if self.only_effect:
             attr_f_flatten             = theta_flatten[:self.index_flatten_theta_f[-1]]
             attr_pi_flatten_incomplete = theta_flatten[self.index_flatten_theta_f[-1]:]
             attr_pi_flatten_complete   = np.zeros(self.attr_pi_flatten_len)
             attr_pi_flatten_complete[self.index_eft_flatten_attr_pi] = attr_pi_flatten_incomplete
             theta_flatten = np.append(attr_f_flatten,attr_pi_flatten_complete)
+        
         return theta_flatten
     
     @staticmethod
